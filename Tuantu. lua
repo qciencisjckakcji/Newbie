@@ -1,0 +1,719 @@
+local cloneref = cloneref or function(obj) return obj end
+local Players = cloneref(game:GetService("Players"))
+local UIS = cloneref(game:GetService("UserInputService"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local Lighting = cloneref(game:GetService("Lighting"))
+
+local LocalPlayer = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local alive = true
+local connections, instances, threads = {}, {}, {}
+
+local function trackConn(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+local function trackInst(inst)
+	table.insert(instances, inst)
+	return inst
+end
+
+local function cleanup()
+	alive = false
+	for _, conn in ipairs(connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	for _, th in ipairs(threads) do
+		pcall(task.cancel, th)
+	end
+	for _, inst in ipairs(instances) do
+		pcall(function() inst:Destroy() end)
+	end
+	table.clear(connections)
+	table.clear(threads)
+	table.clear(instances)
+end
+
+if env.DarkwenCleanup then
+	pcall(env.DarkwenCleanup)
+end
+env.DarkwenCleanup = cleanup
+
+local LAG_PATTERNS = { "antilag", "lagreduc", "lagfix", "lagzone", "lagblock", "lagbarrier" }
+local EFFECT_CLASSES = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+local TAB_NAMES = { "Combat", "Performance", "Work" }
+
+local State = {
+	DamageMultiplier = 1,
+	HitboxEnabled = false,
+	HitboxSize = 10,
+	InfiniteAttackSpeed = false,
+	AttackSpeed = 5,
+	Invincible = false,
+	FpsCap = 240,
+	WorkType = "Instinct",
+	WorkTypes = { "Instinct", "Insight", "Attachment", "Repression" },
+	Talents = {},
+	SelectedTalent = "",
+	SelectedAbnos = {},
+}
+
+local isMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
+local ROW = isMobile and 38 or 28
+local FONT_SIZE = isMobile and 16 or 14
+
+local C = {
+	bg = Color3.fromRGB(20, 20, 24),
+	panel = Color3.fromRGB(28, 28, 34),
+	btn = Color3.fromRGB(40, 40, 48),
+	on = Color3.fromRGB(46, 150, 90),
+	accent = Color3.fromRGB(70, 120, 220),
+	text = Color3.fromRGB(235, 235, 240),
+	muted = Color3.fromRGB(160, 160, 170),
+}
+
+local function getPath(root, ...)
+	local cur = root
+	for _, name in ipairs({ ... }) do
+		if not cur then return nil end
+		cur = cur:FindFirstChild(name)
+	end
+	return cur
+end
+
+local function childNames(folder)
+	local t = {}
+	if folder then
+		for _, c in ipairs(folder:GetChildren()) do
+			table.insert(t, c.Name)
+		end
+	end
+	table.sort(t)
+	return t
+end
+
+local function getGuiParent()
+	if gethui then
+		local ok, h = pcall(gethui)
+		if ok and h then return h end
+	end
+	local ok, core = pcall(function() return cloneref(game:GetService("CoreGui")) end)
+	if ok and core then return core end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local baseValue = setmetatable({}, { __mode = "k" })
+local lastWritten = setmetatable({}, { __mode = "k" })
+local hitboxBase = setmetatable({}, { __mode = "k" })
+
+local function scaleDamage(v)
+	if not (v:IsA("NumberValue") or v:IsA("IntValue")) then return end
+	if lastWritten[v] == nil or v.Value ~= lastWritten[v] then
+		baseValue[v] = v.Value
+	end
+	local target = baseValue[v] * State.DamageMultiplier
+	if v.Value ~= target then
+		v.Value = target
+	end
+	lastWritten[v] = v.Value
+end
+
+local function applyTool(tool)
+	if not tool:IsA("Tool") then return end
+
+	local sv = tool:FindFirstChild("SettingValues")
+	if sv then
+		for _, name in ipairs({ "MaxDamageValue", "MinDamageValue" }) do
+			local v = sv:FindFirstChild(name)
+			if v then pcall(scaleDamage, v) end
+		end
+	end
+
+	local atk = getPath(tool, "Animations", "AttackAnimations")
+	if atk then
+		local s = State.HitboxSize
+		local target = Vector3.new(s, s, s)
+		for _, anim in ipairs(atk:GetChildren()) do
+			local hb = anim:FindFirstChild("HitboxSize")
+			if hb and hb:IsA("Vector3Value") then
+				if State.HitboxEnabled then
+					if hitboxBase[hb] == nil then hitboxBase[hb] = hb.Value end
+					if hb.Value ~= target then hb.Value = target end
+				elseif hitboxBase[hb] and hb.Value ~= hitboxBase[hb] then
+					hb.Value = hitboxBase[hb]
+				end
+			end
+		end
+	end
+end
+
+local function forEachTool(fn)
+	local bp = LocalPlayer:FindFirstChild("Backpack")
+	if bp then
+		for _, t in ipairs(bp:GetChildren()) do fn(t) end
+	end
+	local ch = LocalPlayer.Character
+	if ch then
+		for _, t in ipairs(ch:GetChildren()) do fn(t) end
+	end
+end
+
+local function getAttackSpeedValue()
+	local units = workspace:FindFirstChild("Units")
+	local unit = units and units:FindFirstChild(LocalPlayer.Name)
+	local stats = unit and unit:FindFirstChild("CharStats")
+	local v = stats and stats:FindFirstChild("AttackSpeed")
+	if v and v:IsA("ValueBase") then return v end
+	return nil
+end
+
+local function setAttackSpeed(val)
+	local v = getAttackSpeedValue()
+	if v and v.Value ~= val then
+		pcall(function() v.Value = val end)
+	end
+end
+
+local statusLabel
+local function setStatus(msg)
+	if statusLabel then statusLabel.Text = msg end
+end
+
+local function setFpsCap(v)
+	State.FpsCap = v
+	if setfpscap then pcall(setfpscap, v) end
+	setStatus("FPS cap set to " .. tostring(v))
+end
+
+local function isInPlayerCharacter(inst)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Character and inst:IsDescendantOf(p.Character) then return true end
+	end
+	return false
+end
+
+local function matchesLag(name)
+	local n = (string.lower(name):gsub("[%s_%-]", ""))
+	for _, pat in ipairs(LAG_PATTERNS) do
+		if string.find(n, pat, 1, true) then return true end
+	end
+	return false
+end
+
+local function removeLagStructures()
+	local removed = 0
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if matchesLag(inst.Name) and not isInPlayerCharacter(inst) then
+			if pcall(function() inst:Destroy() end) then removed += 1 end
+		end
+	end
+	return removed
+end
+
+local function removeNPCs()
+	local targets = {}
+	local abno = workspace:FindFirstChild("Abnormalities")
+	if abno then
+		for _, c in ipairs(abno:GetChildren()) do table.insert(targets, c) end
+	end
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model")
+			and m.Name ~= LocalPlayer.Name
+			and not Players:GetPlayerFromCharacter(m)
+			and m:FindFirstChildOfClass("Humanoid")
+			and not isInPlayerCharacter(m) then
+			table.insert(targets, m)
+		end
+	end
+	local n = 0
+	for _, m in ipairs(targets) do
+		if m.Parent and pcall(function() m:Destroy() end) then n += 1 end
+	end
+	return n
+end
+
+local function disableEffects()
+	local n = 0
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if EFFECT_CLASSES[d.ClassName] then
+			if pcall(function() d.Enabled = false end) then n += 1 end
+		end
+	end
+	return n
+end
+
+local hpGuard = false
+local function bindHealth(hum)
+	local last = hum.Health
+	trackConn(hum.HealthChanged:Connect(function(hp)
+		if hpGuard then return end
+		if State.Invincible and hp < last then
+			hpGuard = true
+			hum.Health = last
+			hpGuard = false
+		else
+			last = hp
+		end
+	end))
+end
+
+local function onCharacter(char)
+	trackConn(char.ChildAdded:Connect(applyTool))
+	task.spawn(function()
+		local hum = char:WaitForChild("Humanoid", 10)
+		if hum and alive then bindHealth(hum) end
+	end)
+end
+
+if LocalPlayer.Character then onCharacter(LocalPlayer.Character) end
+trackConn(LocalPlayer.CharacterAdded:Connect(onCharacter))
+
+task.spawn(function()
+	local bp = LocalPlayer:WaitForChild("Backpack", 15)
+	if bp and alive then trackConn(bp.ChildAdded:Connect(applyTool)) end
+end)
+
+State.Talents = childNames(getPath(ReplicatedStorage, "Assets", "Talents"))
+State.SelectedTalent = State.Talents[1] or ""
+
+local function makeDraggable(handle, target, onClick)
+	local dragging, moved = false, false
+	local dragStart, startPos
+
+	trackConn(handle.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		dragging = true
+		moved = false
+		dragStart = input.Position
+		startPos = target.Position
+		local endConn
+		endConn = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+				endConn:Disconnect()
+				if not moved and onClick then onClick() end
+			end
+		end)
+	end))
+
+	trackConn(UIS.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local d = input.Position - dragStart
+		if d.Magnitude > 6 then moved = true end
+		if moved then
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+end
+
+local function corner(obj, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 8)
+	c.Parent = obj
+	return c
+end
+
+local screen = trackInst(Instance.new("ScreenGui"))
+screen.Name = "DarkwenTuantus"
+screen.ResetOnSpawn = false
+screen.DisplayOrder = 999
+screen.Parent = getGuiParent()
+
+local titleH = ROW + 8
+local tabY = titleH + 6
+local contentY = tabY + ROW + 6
+
+local window = Instance.new("Frame")
+window.Name = "Main"
+window.AnchorPoint = Vector2.new(0.5, 0.5)
+window.Position = UDim2.fromScale(0.5, 0.5)
+window.Size = UDim2.fromScale(0.42, 0.62)
+window.BackgroundColor3 = C.bg
+window.BorderSizePixel = 0
+window.Parent = screen
+corner(window, 10)
+
+local sizeLimit = Instance.new("UISizeConstraint")
+sizeLimit.MinSize = Vector2.new(280, 320)
+sizeLimit.MaxSize = Vector2.new(560, 620)
+sizeLimit.Parent = window
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, titleH)
+titleBar.BackgroundColor3 = C.panel
+titleBar.BorderSizePixel = 0
+titleBar.Parent = window
+corner(titleBar, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -(ROW + 16), 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Darkwen | Tuantus Lobotomized"
+title.TextColor3 = C.text
+title.TextSize = FONT_SIZE
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(ROW, ROW)
+closeBtn.Position = UDim2.new(1, -(ROW + 4), 0, 4)
+closeBtn.BackgroundColor3 = C.btn
+closeBtn.BorderSizePixel = 0
+closeBtn.Text = "X"
+closeBtn.TextColor3 = C.text
+closeBtn.TextSize = FONT_SIZE
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.Parent = titleBar
+corner(closeBtn, 6)
+
+local tabBar = Instance.new("Frame")
+tabBar.Position = UDim2.fromOffset(6, tabY)
+tabBar.Size = UDim2.new(1, -12, 0, ROW)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = window
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Parent = tabBar
+
+local content = Instance.new("Frame")
+content.Position = UDim2.fromOffset(6, contentY)
+content.Size = UDim2.new(1, -12, 1, -(contentY + ROW + 12))
+content.BackgroundTransparency = 1
+content.ClipsDescendants = true
+content.Parent = window
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Position = UDim2.new(0, 8, 1, -(ROW + 6))
+statusLabel.Size = UDim2.new(1, -16, 0, ROW)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Ready"
+statusLabel.TextColor3 = C.muted
+statusLabel.TextSize = FONT_SIZE - 1
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+statusLabel.Parent = window
+
+local function newPage()
+	local page = Instance.new("ScrollingFrame")
+	page.Size = UDim2.fromScale(1, 1)
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel = 0
+	page.ScrollBarThickness = 4
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.CanvasSize = UDim2.new()
+	page.Visible = false
+	page.Parent = content
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 4)
+	pad.PaddingTop = UDim.new(0, 4)
+	pad.Parent = page
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+	return page
+end
+
+local function baseButton(parent, text)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -8, 0, ROW)
+	b.BackgroundColor3 = C.btn
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = C.text
+	b.TextSize = FONT_SIZE
+	b.Font = Enum.Font.GothamMedium
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.AutoButtonColor = true
+	corner(b, 6)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 10)
+	pad.Parent = b
+	b.Parent = parent
+	return b
+end
+
+local function addSection(parent, text)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, -8, 0, ROW)
+	l.BackgroundTransparency = 1
+	l.Text = string.upper(text)
+	l.TextColor3 = C.accent
+	l.TextSize = FONT_SIZE
+	l.Font = Enum.Font.GothamBold
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+end
+
+local function addButton(parent, text, cb)
+	local b = baseButton(parent, text)
+	trackConn(b.Activated:Connect(cb))
+	return b
+end
+
+local function addToggle(parent, text, default, cb)
+	local state = default
+	local b = baseButton(parent, "")
+	local function paint()
+		b.Text = (state and "[ON]  " or "[OFF] ") .. text
+		b.BackgroundColor3 = state and C.on or C.btn
+	end
+	paint()
+	trackConn(b.Activated:Connect(function()
+		state = not state
+		paint()
+		cb(state)
+	end))
+	return function(v)
+		state = v
+		paint()
+	end
+end
+
+local function addInput(parent, label, default, cb)
+	local current = default
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -8, 0, ROW)
+	box.BackgroundColor3 = C.btn
+	box.BorderSizePixel = 0
+	box.Text = tostring(default)
+	box.PlaceholderText = label
+	box.ClearTextOnFocus = false
+	box.TextColor3 = C.text
+	box.PlaceholderColor3 = C.muted
+	box.TextSize = FONT_SIZE
+	box.Font = Enum.Font.GothamMedium
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	corner(box, 6)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 10)
+	pad.Parent = box
+	box.Parent = parent
+	trackConn(box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n and n > 0 then
+			current = n
+			cb(n)
+		else
+			box.Text = tostring(current)
+		end
+	end))
+end
+
+local function addCycle(parent, label, options, default, cb)
+	if #options == 0 then options = { "None" } end
+	local idx = table.find(options, default) or 1
+	local b = baseButton(parent, "")
+	local function paint()
+		b.Text = label .. ": " .. options[idx]
+	end
+	paint()
+	trackConn(b.Activated:Connect(function()
+		idx = idx % #options + 1
+		paint()
+		cb(options[idx])
+	end))
+end
+
+local tabButtons, pages = {}, {}
+
+local function selectTab(name)
+	for n, page in pairs(pages) do page.Visible = (n == name) end
+	for n, b in pairs(tabButtons) do
+		b.BackgroundColor3 = (n == name) and C.accent or C.btn
+	end
+end
+
+for _, name in ipairs(TAB_NAMES) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1 / 3, -4, 1, 0)
+	b.BackgroundColor3 = C.btn
+	b.BorderSizePixel = 0
+	b.Text = name
+	b.TextColor3 = C.text
+	b.TextSize = FONT_SIZE
+	b.Font = Enum.Font.GothamBold
+	b.Parent = tabBar
+	corner(b, 6)
+	tabButtons[name] = b
+	pages[name] = newPage()
+	trackConn(b.Activated:Connect(function() selectTab(name) end))
+end
+
+local combat = pages["Combat"]
+addSection(combat, "Damage")
+addInput(combat, "Damage Multiplier (default 1)", State.DamageMultiplier, function(n)
+	State.DamageMultiplier = n
+	setStatus("Damage multiplier: x" .. tostring(n))
+end)
+
+addSection(combat, "Hitbox")
+addToggle(combat, "Hitbox Expander", false, function(v)
+	State.HitboxEnabled = v
+	setStatus("Hitbox expander: " .. (v and "ON" or "OFF"))
+end)
+addInput(combat, "Hitbox Size (default 10)", State.HitboxSize, function(n)
+	State.HitboxSize = n
+	setStatus("Hitbox size: " .. tostring(n))
+end)
+
+addSection(combat, "Attack Speed")
+addToggle(combat, "Infinite Attack Speed", false, function(v)
+	State.InfiniteAttackSpeed = v
+	if v then
+		setAttackSpeed(math.huge)
+	else
+		setAttackSpeed(State.AttackSpeed)
+	end
+	setStatus("Infinite attack speed: " .. (v and "ON" or "OFF"))
+end)
+addInput(combat, "Attack Speed Value (default 5)", State.AttackSpeed, function(n)
+	State.AttackSpeed = n
+	if not State.InfiniteAttackSpeed then setAttackSpeed(n) end
+	setStatus("Attack speed value: " .. tostring(n))
+end)
+
+addSection(combat, "Survival")
+addToggle(combat, "Invincible (incoming damage = 0)", false, function(v)
+	State.Invincible = v
+	setStatus("Invincible: " .. (v and "ON" or "OFF"))
+end)
+
+local perf = pages["Performance"]
+addSection(perf, "FPS Lock")
+addButton(perf, "Lock 120 FPS", function() setFpsCap(120) end)
+addButton(perf, "Lock 144 FPS", function() setFpsCap(144) end)
+addButton(perf, "Lock 240 FPS", function() setFpsCap(240) end)
+addButton(perf, "Unlock FPS", function() setFpsCap(999) end)
+
+addSection(perf, "Boost")
+addButton(perf, "Boost FPS (all below)", function()
+	setFpsCap(240)
+	pcall(function() Lighting.GlobalShadows = false end)
+	local fx = disableEffects()
+	local lag = removeLagStructures()
+	local npc = removeNPCs()
+	setStatus(string.format("Boost done: %d effects, %d lag objects, %d NPCs removed", fx, lag, npc))
+end)
+addButton(perf, "Remove Lag Structures", function()
+	setStatus("Removed " .. removeLagStructures() .. " lag structures")
+end)
+addButton(perf, "Remove All NPCs", function()
+	setStatus("Removed " .. removeNPCs() .. " NPCs")
+end)
+addButton(perf, "Disable Effects", function()
+	setStatus("Disabled " .. disableEffects() .. " effects")
+end)
+
+local work = pages["Work"]
+addSection(work, "Abnormality Work")
+addCycle(work, "Work Type", State.WorkTypes, State.WorkType, function(v)
+	State.WorkType = v
+end)
+
+local abnoHolder = Instance.new("Frame")
+abnoHolder.Size = UDim2.new(1, -8, 0, 0)
+abnoHolder.AutomaticSize = Enum.AutomaticSize.Y
+abnoHolder.BackgroundTransparency = 1
+abnoHolder.Parent = work
+local abnoLayout = Instance.new("UIListLayout")
+abnoLayout.Padding = UDim.new(0, 4)
+abnoLayout.SortOrder = Enum.SortOrder.LayoutOrder
+abnoLayout.Parent = abnoHolder
+
+local function rebuildAbnos()
+	for _, c in ipairs(abnoHolder:GetChildren()) do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+	for _, name in ipairs(childNames(workspace:FindFirstChild("Abnormalities"))) do
+		addToggle(abnoHolder, name, State.SelectedAbnos[name] == true, function(v)
+			if v then
+				State.SelectedAbnos[name] = true
+			else
+				State.SelectedAbnos[name] = nil
+			end
+		end)
+	end
+end
+
+addButton(work, "Refresh Abnormality List", function()
+	rebuildAbnos()
+	setStatus("Abnormality list refreshed")
+end)
+
+addButton(work, "Clear Selection", function()
+	State.SelectedAbnos = {}
+	rebuildAbnos()
+	setStatus("Selection cleared")
+end)
+
+addButton(work, "Work Selected Abnormalities", function()
+	local remote = getPath(ReplicatedStorage, "Assets", "RemoteEvents", "WorkEvent")
+	local root = workspace:FindFirstChild("Abnormalities")
+	if not remote or not root then
+		setStatus("Work remote or Abnormalities folder not found")
+		return
+	end
+	local count = 0
+	for name in pairs(State.SelectedAbnos) do
+		local abno = root:FindFirstChild(name)
+		local wt = abno and abno:FindFirstChild("WorkTablet")
+		if wt then
+			if pcall(function() remote:FireServer(wt, State.WorkType) end) then
+				count += 1
+			end
+		end
+	end
+	setStatus("Worked " .. count .. " abnormalities")
+end)
+
+addSection(work, "Card Selector")
+addCycle(work, "Talent", State.Talents, State.SelectedTalent, function(v)
+	State.SelectedTalent = v
+end)
+addButton(work, "Select Card", function()
+	local sel = State.SelectedTalent
+	if sel == "" or sel == "None" then
+		setStatus("No talent selected")
+		return
+	end
+	local remote = getPath(ReplicatedStorage, "Assets", "RemoteEvents", "SelectCardEvent")
+	if not remote then
+		setStatus("SelectCardEvent not found")
+		return
+	end
+	pcall(function() remote:FireServer(sel) end)
+	setStatus("Selected card: " .. sel)
+end)
+
+rebuildAbnos()
+selectTab("Combat")
+
+local function toggleWindow()
+	window.Visible = not window.Visible
+end
+
+trackConn(closeBtn.Activated:Connect(toggleWindow))
+makeDraggable(titleBar, window)
+
+local floatSize = isMobile and 48 or 40
+local floatBtn = Instance.new("TextButton")
+floatBtn.Size = UDim2.fromOffset(floatSize, floatSize)
+floatBtn.Position = UDim2.new(0, 8, 0.4, 0)
+floatBtn.BackgroundColor3 = C.accent
+floatBtn.Bord
